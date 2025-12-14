@@ -1,6 +1,9 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
 // ---------- TFT pin definitions ----------
 #define TFT_DC 16
@@ -28,6 +31,23 @@
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
+// ---------- WiFi and MQTT Configuration ----------
+const char *ssid = "Xiaomi 14T";               // Change this
+const char *password = "password";             // Change this
+const char *mqtt_server = "broker.hivemq.com"; // Change to your MQTT broker
+const int mqtt_port = 1883;
+
+// MQTT Topics - adjust these to match your sensor publisher
+// const char *topic_temperature = "sensor/temperature";
+// const char *topic_humidity = "sensor/humidity";
+// const char *topic_pressure = "sensor/pressure";
+// const char *topic_gas = "sensor/gas";
+// const char *topic_altitude = "sensor/altitude";
+const char *topic_sensor_json = "test/topic";
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
 // ---------- Sensor data variables ----------
 float temperature = 25.3; // Example values
 float humidity = 65.2;
@@ -42,6 +62,20 @@ int topMargin = 30;         // Space for title
 int maxScroll = 0;          // Maximum scroll value
 int totalContentHeight = 0; // Total height of all content
 
+// ---------- Status variables ----------
+bool wifiConnected = false;
+bool mqttConnected = false;
+
+// ---------- RTOS Handles ----------
+TaskHandle_t TaskDisplay;
+TaskHandle_t TaskMQTT;
+
+// ---------- Mutex for sensor data protection ----------
+SemaphoreHandle_t sensorDataMutex;
+
+// ---------- Flag to trigger display update ----------
+volatile bool needsRedraw = false;
+
 // -----------------------------------------------------------------------------
 // Backlight helpers
 // -----------------------------------------------------------------------------
@@ -55,6 +89,95 @@ void backlightSetup()
   ledcSetup(TFT_BKL_CH, TFT_BKL_FREQ, TFT_BKL_RES);
   ledcAttachPin(TFT_BKL, TFT_BKL_CH);
   setBacklight(200); // start at ~80% brightness
+}
+
+// -----------------------------------------------------------------------------
+// WiFi Connection
+// -----------------------------------------------------------------------------
+void setupWiFi()
+{
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    wifiConnected = true;
+    Serial.println("\nWiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  }
+}
+
+// -----------------------------------------------------------------------------
+// MQTT Callback - receives sensor data
+// -----------------------------------------------------------------------------
+void mqttCallback(char *topic, byte *payload, unsigned int length)
+{
+  Serial.print("Message received [");
+  Serial.print(topic);
+  Serial.println("]");
+
+  // Convert payload to string
+  String jsonString;
+  for (unsigned int i = 0; i < length; i++)
+  {
+    jsonString += (char)payload[i];
+  }
+
+  Serial.println(jsonString);
+
+  // Parse JSON
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, jsonString);
+
+  if (error)
+  {
+    Serial.print("JSON parse failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  // Lock mutex
+  if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY) == pdTRUE)
+  {
+    temperature = doc["temperature"] | temperature;
+    humidity = doc["humidity"] | humidity;
+    pressure = doc["pressure"] | pressure;
+    gas_resistance = doc["gas_resistance"] | gas_resistance;
+    altitude = doc["altitude"] | altitude;
+
+    xSemaphoreGive(sensorDataMutex);
+
+    needsRedraw = true;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// MQTT Connection
+// -----------------------------------------------------------------------------
+bool reconnectMQTT()
+{
+  if (mqttClient.connect("ESP32_Display_Client"))
+  {
+    mqttConnected = true;
+    Serial.println("MQTT Connected");
+
+    // Subscribe to all sensor topics
+    mqttClient.subscribe(topic_sensor_json);
+
+    Serial.println("Subscribed to sensor topics");
+    needsRedraw = true;
+    return true;
+  }
+  mqttConnected = false;
+  needsRedraw = true;
+  return false;
 }
 
 // -----------------------------------------------------------------------------
@@ -125,6 +248,26 @@ void drawSensorData()
   tft.setCursor(10, 8);
   tft.print("Sensor Data");
 
+  // Show connection status
+  tft.setTextSize(1);
+  if (wifiConnected)
+  {
+    tft.fillCircle(TFT_WIDTH - 30, 10, 3, ST77XX_GREEN);
+  }
+  else
+  {
+    tft.fillCircle(TFT_WIDTH - 30, 10, 3, ST77XX_RED);
+  }
+  if (mqttConnected)
+  {
+    tft.fillCircle(TFT_WIDTH - 15, 10, 3, ST77XX_GREEN);
+  }
+  else
+  {
+    tft.fillCircle(TFT_WIDTH - 15, 10, 3, ST77XX_RED);
+  }
+  tft.setTextSize(2);
+
   // Calculate total content height
   int numLines = 5;                                // Number of data lines
   totalContentHeight = numLines * lineHeight + 20; // +20 for padding
@@ -140,69 +283,72 @@ void drawSensorData()
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_WHITE);
 
-  // Starting Y position (adjusted for scroll)
-  int y = topMargin + 10 - scrollOffset;
-  int iconX = 5;
-  int textX = 25;
-  int barX = 150;
-  int barW = 65;
-
-  // Temperature
-  if (y > topMargin - lineHeight && y < TFT_HEIGHT)
+  // Lock mutex before reading sensor data
+  if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY) == pdTRUE)
   {
-    drawTempIcon(iconX, y);
-    tft.setCursor(textX, y);
-    tft.print(temperature, 1);
-    tft.print("C");
-    drawBarGraph(barX, y + 2, barW, 12, temperature, 0, 50, ST77XX_RED);
-  }
-  y += lineHeight;
+    // Starting Y position (adjusted for scroll)
+    int y = topMargin + 10 - scrollOffset;
+    int iconX = 5;
+    int textX = 25;
+    int barX = 150;
+    int barW = 65;
 
-  // Humidity
-  if (y > topMargin - lineHeight && y < TFT_HEIGHT)
-  {
-    drawHumidityIcon(iconX, y);
-    tft.setCursor(textX, y);
-    tft.print(humidity, 1);
-    tft.print("%");
-    drawBarGraph(barX, y + 2, barW, 12, humidity, 0, 100, ST77XX_CYAN);
-  }
-  y += lineHeight;
+    // Temperature
+    if (y > topMargin - lineHeight && y < TFT_HEIGHT)
+    {
+      drawTempIcon(iconX, y);
+      tft.setCursor(textX, y);
+      tft.print(temperature, 1);
+      tft.print("C");
+      drawBarGraph(barX, y + 2, barW, 12, temperature, 0, 50, ST77XX_RED);
+    }
+    y += lineHeight;
 
-  // Pressure
-  if (y > topMargin - lineHeight && y < TFT_HEIGHT)
-  {
-    drawPressureIcon(iconX, y);
-    tft.setCursor(textX, y);
-    tft.setTextSize(2);
-    tft.print(pressure, 1);
-    tft.print("hPa");
-    tft.setTextSize(2);
-    drawBarGraph(barX, y + 2, barW, 12, pressure, 950, 1050, ST77XX_YELLOW);
-  }
-  y += lineHeight;
+    // Humidity
+    if (y > topMargin - lineHeight && y < TFT_HEIGHT)
+    {
+      drawHumidityIcon(iconX, y);
+      tft.setCursor(textX, y);
+      tft.print(humidity, 1);
+      tft.print("%");
+      drawBarGraph(barX, y + 2, barW, 12, humidity, 0, 100, ST77XX_CYAN);
+    }
+    y += lineHeight;
 
-  // Gas
-  if (y > topMargin - lineHeight && y < TFT_HEIGHT)
-  {
-    drawGasIcon(iconX, y);
-    tft.setCursor(textX, y);
-    tft.setTextSize(2);
-    tft.print(gas_resistance / 1000);
-    tft.print("k");
-    tft.setTextSize(2);
-    drawBarGraph(barX, y + 2, barW, 12, gas_resistance, 0, 300000, ST77XX_MAGENTA);
-  }
-  y += lineHeight;
+    // Pressure
+    if (y > topMargin - lineHeight && y < TFT_HEIGHT)
+    {
+      drawPressureIcon(iconX, y);
+      tft.setCursor(textX, y);
+      tft.print(pressure, 0);
+      tft.print("hPa");
+      drawBarGraph(barX, y + 2, barW, 12, pressure, 950, 1050, ST77XX_YELLOW);
+    }
+    y += lineHeight;
 
-  // Altitude
-  if (y > topMargin - lineHeight && y < TFT_HEIGHT)
-  {
-    drawAltitudeIcon(iconX, y);
-    tft.setCursor(textX, y);
-    tft.print(altitude, 1);
-    tft.print("m");
-    drawBarGraph(barX, y + 2, barW, 12, altitude, 0, 500, ST77XX_GREEN);
+    // Gas
+    if (y > topMargin - lineHeight && y < TFT_HEIGHT)
+    {
+      drawGasIcon(iconX, y);
+      tft.setCursor(textX, y);
+      tft.print(gas_resistance / 1000);
+      tft.print("k");
+      drawBarGraph(barX, y + 2, barW, 12, gas_resistance, 0, 300000, ST77XX_MAGENTA);
+    }
+    y += lineHeight;
+
+    // Altitude
+    if (y > topMargin - lineHeight && y < TFT_HEIGHT)
+    {
+      drawAltitudeIcon(iconX, y);
+      tft.setCursor(textX, y);
+      tft.print(altitude, 1);
+      tft.print("m");
+      drawBarGraph(barX, y + 2, barW, 12, altitude, 0, 500, ST77XX_GREEN);
+    }
+
+    // Release mutex
+    xSemaphoreGive(sensorDataMutex);
   }
 
   // Draw scroll indicator if content overflows
@@ -272,18 +418,131 @@ void drawCenterOK()
 }
 
 // -----------------------------------------------------------------------------
-// Setup & loop
+// RTOS Task: Display & Button Handling
+// -----------------------------------------------------------------------------
+void TaskDisplayCode(void *parameter)
+{
+  Serial.println("Display Task started on core " + String(xPortGetCoreID()));
+
+  bool lastUpState = false;
+  bool lastDownState = false;
+
+  for (;;)
+  {
+    // Read button states
+    bool up = (digitalRead(SW_UP) == LOW);
+    bool down = (digitalRead(SW_DOWN) == LOW);
+    bool left = (digitalRead(SW_LEFT) == LOW);
+    bool right = (digitalRead(SW_RIGHT) == LOW);
+    bool center = (digitalRead(SW_CENTER) == LOW);
+
+    // Detect rising edge for scrolling
+    bool upPressed = up && !lastUpState;
+    bool downPressed = down && !lastDownState;
+
+    lastUpState = up;
+    lastDownState = down;
+
+    // Handle scrolling
+    if (upPressed && scrollOffset > 0)
+    {
+      scrollOffset -= lineHeight;
+      if (scrollOffset < 0)
+        scrollOffset = 0;
+      needsRedraw = true;
+      Serial.println("Scroll UP");
+    }
+    else if (downPressed && scrollOffset < maxScroll)
+    {
+      scrollOffset += lineHeight;
+      if (scrollOffset > maxScroll)
+        scrollOffset = maxScroll;
+      needsRedraw = true;
+      Serial.println("Scroll DOWN");
+    }
+    else if (left)
+    {
+      drawArrowLeft();
+      Serial.println("LEFT");
+      vTaskDelay(300 / portTICK_PERIOD_MS); // Debounce
+    }
+    else if (right)
+    {
+      drawArrowRight();
+      Serial.println("RIGHT");
+      vTaskDelay(300 / portTICK_PERIOD_MS); // Debounce
+    }
+    else if (center)
+    {
+      // Reset scroll and redraw
+      scrollOffset = 0;
+      needsRedraw = true;
+      Serial.println("CENTER - Reset View");
+      vTaskDelay(300 / portTICK_PERIOD_MS); // Debounce
+    }
+
+    // Redraw if needed
+    if (needsRedraw)
+    {
+      drawSensorData();
+      needsRedraw = false;
+    }
+
+    vTaskDelay(50 / portTICK_PERIOD_MS); // 50ms update rate
+  }
+}
+
+// -----------------------------------------------------------------------------
+// RTOS Task: MQTT Handling
+// -----------------------------------------------------------------------------
+void TaskMQTTCode(void *parameter)
+{
+  Serial.println("MQTT Task started on core " + String(xPortGetCoreID()));
+
+  unsigned long lastReconnectAttempt = 0;
+
+  for (;;)
+  {
+    if (wifiConnected)
+    {
+      if (!mqttClient.connected())
+      {
+        unsigned long now = millis();
+        if (now - lastReconnectAttempt > 5000)
+        { // Try reconnecting every 5 seconds
+          lastReconnectAttempt = now;
+          Serial.println("Attempting MQTT reconnection...");
+          if (reconnectMQTT())
+          {
+            lastReconnectAttempt = 0;
+          }
+        }
+      }
+      else
+      {
+        mqttClient.loop(); // Process incoming MQTT messages
+      }
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS); // 10ms update rate for MQTT
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Setup & Main Loop
 // -----------------------------------------------------------------------------
 void setup()
 {
   Serial.begin(115200);
 
+  Serial.println("Starting ESP32 Sensor Display with RTOS...");
+
   // Switch pins as inputs with internal pull-ups
-  // pinMode(SW_UP, INPUT_PULLUP);
-  // pinMode(SW_DOWN, INPUT_PULLUP);
-  // pinMode(SW_LEFT, INPUT_PULLUP);
-  // pinMode(SW_RIGHT, INPUT_PULLUP);
-  // pinMode(SW_CENTER, INPUT_PULLUP);
+  pinMode(SW_UP, INPUT_PULLUP);
+  pinMode(SW_DOWN, INPUT_PULLUP);
+  pinMode(SW_LEFT, INPUT_PULLUP);
+  pinMode(SW_RIGHT, INPUT_PULLUP);
+  pinMode(SW_CENTER, INPUT_PULLUP);
 
   // TFT
   tft.init(TFT_WIDTH, TFT_HEIGHT);
@@ -293,82 +552,57 @@ void setup()
   // Backlight
   backlightSetup();
 
+  // Show connecting message
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(10, 100);
+  tft.print("Connecting...");
+
+  // Create mutex for sensor data protection
+  sensorDataMutex = xSemaphoreCreateMutex();
+
+  // Setup WiFi
+  setupWiFi();
+
+  // Setup MQTT
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+
+  // Try to connect to MQTT
+  if (wifiConnected)
+  {
+    reconnectMQTT();
+  }
+
   // Display sensor data initially
   drawSensorData();
-}
 
-unsigned long lastCheck = 0;
-const unsigned long pollIntervalMs = 50;
-bool lastUpState = false;
-bool lastDownState = false;
+  // Create RTOS Tasks
+  // Task 1: Display & Button handling on Core 1
+  xTaskCreatePinnedToCore(
+      TaskDisplayCode, /* Task function */
+      "TaskDisplay",   /* Name of task */
+      10000,           /* Stack size (bytes) */
+      NULL,            /* Parameter passed to task */
+      1,               /* Task priority */
+      &TaskDisplay,    /* Task handle */
+      1);              /* Core where task runs (Core 1) */
+
+  // Task 2: MQTT handling on Core 0
+  xTaskCreatePinnedToCore(
+      TaskMQTTCode, /* Task function */
+      "TaskMQTT",   /* Name of task */
+      10000,        /* Stack size (bytes) */
+      NULL,         /* Parameter passed to task */
+      1,            /* Task priority */
+      &TaskMQTT,    /* Task handle */
+      0);           /* Core where task runs (Core 0) */
+
+  Serial.println("RTOS Tasks created successfully!");
+}
 
 void loop()
 {
-  if (millis() - lastCheck < pollIntervalMs)
-    return;
-  lastCheck = millis();
-
-  bool up = (digitalRead(SW_UP) == LOW);
-  bool down = (digitalRead(SW_DOWN) == LOW);
-  bool left = (digitalRead(SW_LEFT) == LOW);
-  bool right = (digitalRead(SW_RIGHT) == LOW);
-  bool center = (digitalRead(SW_CENTER) == LOW);
-
-  // Detect rising edge for scrolling (button just pressed)
-  bool upPressed = up && !lastUpState;
-  bool downPressed = down && !lastDownState;
-
-  lastUpState = up;
-  lastDownState = down;
-
-  // Handle scrolling
-  // if (upPressed && scrollOffset > 0)
-  // {
-  //   scrollOffset -= lineHeight;
-  //   if (scrollOffset < 0)
-  //     scrollOffset = 0;
-  //   drawSensorData();
-  //   Serial.println("Scroll UP");
-  // }
-  // else if (downPressed && scrollOffset < maxScroll)
-  // {
-  //   scrollOffset += lineHeight;
-  //   if (scrollOffset > maxScroll)
-  //     scrollOffset = maxScroll;
-  //   drawSensorData();
-  //   Serial.println("Scroll DOWN");
-  // }
-  // else if (left)
-  // {
-  //   drawArrowLeft();
-  //   Serial.println("LEFT");
-  // }
-  // else if (right)
-  // {
-  //   drawArrowRight();
-  //   Serial.println("RIGHT");
-  // }
-  // else if (center)
-  // {
-  //   // Reset scroll and redraw
-  //   scrollOffset = 0;
-  //   drawSensorData();
-  //   Serial.println("CENTER - Reset View");
-  // }
-
-  // OPTIONAL: Update sensor data periodically
-  // You would read from your actual sensor here
-  // For demo, you can uncomment this to see changing values:
-  /*
-  static unsigned long lastUpdate = 0;
-  if (millis() - lastUpdate > 2000) {
-    lastUpdate = millis();
-    temperature += random(-10, 10) / 10.0;
-    humidity += random(-5, 5) / 10.0;
-    pressure += random(-2, 2) / 10.0;
-    gas_resistance += random(-1000, 1000);
-    altitude += random(-5, 5) / 10.0;
-    drawSensorData();
-  }
-  */
+  // Empty - all work is done in RTOS tasks
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
