@@ -279,11 +279,11 @@ void setup()
   Serial.begin(115200);
 
   // Switch pins as inputs with internal pull-ups
-  pinMode(SW_UP, INPUT_PULLUP);
-  pinMode(SW_DOWN, INPUT_PULLUP);
-  pinMode(SW_LEFT, INPUT_PULLUP);
-  pinMode(SW_RIGHT, INPUT_PULLUP);
-  pinMode(SW_CENTER, INPUT_PULLUP);
+  // pinMode(SW_UP, INPUT_PULLUP);
+  // pinMode(SW_DOWN, INPUT_PULLUP);
+  // pinMode(SW_LEFT, INPUT_PULLUP);
+  // pinMode(SW_RIGHT, INPUT_PULLUP);
+  // pinMode(SW_CENTER, INPUT_PULLUP);
 
   // TFT
   tft.init(TFT_WIDTH, TFT_HEIGHT);
@@ -322,39 +322,39 @@ void loop()
   lastDownState = down;
 
   // Handle scrolling
-  if (upPressed && scrollOffset > 0)
-  {
-    scrollOffset -= lineHeight;
-    if (scrollOffset < 0)
-      scrollOffset = 0;
-    drawSensorData();
-    Serial.println("Scroll UP");
-  }
-  else if (downPressed && scrollOffset < maxScroll)
-  {
-    scrollOffset += lineHeight;
-    if (scrollOffset > maxScroll)
-      scrollOffset = maxScroll;
-    drawSensorData();
-    Serial.println("Scroll DOWN");
-  }
-  else if (left)
-  {
-    drawArrowLeft();
-    Serial.println("LEFT");
-  }
-  else if (right)
-  {
-    drawArrowRight();
-    Serial.println("RIGHT");
-  }
-  else if (center)
-  {
-    // Reset scroll and redraw
-    scrollOffset = 0;
-    drawSensorData();
-    Serial.println("CENTER - Reset View");
-  }
+  // if (upPressed && scrollOffset > 0)
+  // {
+  //   scrollOffset -= lineHeight;
+  //   if (scrollOffset < 0)
+  //     scrollOffset = 0;
+  //   drawSensorData();
+  //   Serial.println("Scroll UP");
+  // }
+  // else if (downPressed && scrollOffset < maxScroll)
+  // {
+  //   scrollOffset += lineHeight;
+  //   if (scrollOffset > maxScroll)
+  //     scrollOffset = maxScroll;
+  //   drawSensorData();
+  //   Serial.println("Scroll DOWN");
+  // }
+  // else if (left)
+  // {
+  //   drawArrowLeft();
+  //   Serial.println("LEFT");
+  // }
+  // else if (right)
+  // {
+  //   drawArrowRight();
+  //   Serial.println("RIGHT");
+  // }
+  // else if (center)
+  // {
+  //   // Reset scroll and redraw
+  //   scrollOffset = 0;
+  //   drawSensorData();
+  //   Serial.println("CENTER - Reset View");
+  // }
 
   // OPTIONAL: Update sensor data periodically
   // You would read from your actual sensor here
