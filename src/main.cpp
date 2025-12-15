@@ -16,51 +16,51 @@
 // ---------- Backlight PWM ----------
 #define TFT_BKL_CH 0
 #define TFT_BKL_FREQ 5000
-#define TFT_BKL_RES 8 // 0..255
+#define TFT_BKL_RES 8
 
-// ---------- 5-way switch pins (active LOW) ----------
+// ---------- 5-way switch pins ----------
 #define SW_UP 36
 #define SW_DOWN 35
 #define SW_LEFT 13
 #define SW_RIGHT 39
 #define SW_CENTER 34
 
-// Change to your actual ST7789 resolution
 #define TFT_WIDTH 240
 #define TFT_HEIGHT 240
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
 // ---------- WiFi and MQTT Configuration ----------
-const char *ssid = "Xiaomi 14T";               // Change this
-const char *password = "password";             // Change this
-const char *mqtt_server = "broker.hivemq.com"; // Change to your MQTT broker
+const char *ssid = "Xiaomi 14T";
+const char *password = "password";
+const char *mqtt_server = "broker.hivemq.com";
 const int mqtt_port = 1883;
-
-// MQTT Topics - adjust these to match your sensor publisher
-// const char *topic_temperature = "sensor/temperature";
-// const char *topic_humidity = "sensor/humidity";
-// const char *topic_pressure = "sensor/pressure";
-// const char *topic_gas = "sensor/gas";
-// const char *topic_altitude = "sensor/altitude";
-const char *topic_sensor_json = "test/topic";
+const char *topic_sensor_json = "enviroscout/data";
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-// ---------- Sensor data variables ----------
-float temperature = 25.3; // Example values
+// ---------- Sensor data ----------
+float temperature = 25.3;
 float humidity = 65.2;
 float pressure = 1013.25;
 uint32_t gas_resistance = 125000;
 float altitude = 150.5;
+float tvoc = 450.0;
+float eco2 = 800.0;
 
-// ---------- Scrolling variables ----------
-int scrollOffset = 0;       // Current scroll position
-int lineHeight = 20;        // Height of each line
-int topMargin = 30;         // Space for title
-int maxScroll = 0;          // Maximum scroll value
-int totalContentHeight = 0; // Total height of all content
+// ---------- Enhanced UI variables ----------
+int scrollOffset = 0;
+int targetScrollOffset = 0;
+int cardHeight = 36;
+int cardSpacing = 8;
+int topMargin = 45;
+int maxScroll = 0;
+int totalContentHeight = 0;
+
+// Smooth scrolling
+float smoothScroll = 0;
+const float scrollSmoothing = 0.3;
 
 // ---------- Status variables ----------
 bool wifiConnected = false;
@@ -69,15 +69,23 @@ bool mqttConnected = false;
 // ---------- RTOS Handles ----------
 TaskHandle_t TaskDisplay;
 TaskHandle_t TaskMQTT;
-
-// ---------- Mutex for sensor data protection ----------
 SemaphoreHandle_t sensorDataMutex;
-
-// ---------- Flag to trigger display update ----------
 volatile bool needsRedraw = false;
 
+// ---------- Color Palette ----------
+#define COLOR_BG 0x1082     // Dark blue-gray
+#define COLOR_CARD 0x2124   // Slightly lighter card background
+#define COLOR_ACCENT 0x05FF // Cyan accent
+#define COLOR_TEXT_PRIMARY 0xFFFF
+#define COLOR_TEXT_SECONDARY 0x8410
+#define COLOR_TEMP 0xFFFF  // Red
+#define COLOR_HUMID 0x07FF // Cyan
+#define COLOR_PRESS 0xFFE0 // Yellow
+#define COLOR_GAS 0xF81F   // Magenta
+#define COLOR_ALT 0x07E0   // Green
+
 // -----------------------------------------------------------------------------
-// Backlight helpers
+// Backlight
 // -----------------------------------------------------------------------------
 void setBacklight(uint8_t level)
 {
@@ -88,11 +96,11 @@ void backlightSetup()
 {
   ledcSetup(TFT_BKL_CH, TFT_BKL_FREQ, TFT_BKL_RES);
   ledcAttachPin(TFT_BKL, TFT_BKL_CH);
-  setBacklight(200); // start at ~80% brightness
+  setBacklight(200);
 }
 
 // -----------------------------------------------------------------------------
-// WiFi Connection
+// WiFi
 // -----------------------------------------------------------------------------
 void setupWiFi()
 {
@@ -109,51 +117,36 @@ void setupWiFi()
   {
     wifiConnected = true;
     Serial.println("\nWiFi connected");
-    Serial.print("IP address: ");
+    Serial.print("IP: ");
     Serial.println(WiFi.localIP());
   }
 }
 
 // -----------------------------------------------------------------------------
-// MQTT Callback - receives sensor data
+// MQTT Callback
 // -----------------------------------------------------------------------------
 void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
-  Serial.print("Message received [");
-  Serial.print(topic);
-  Serial.println("]");
-
-  // Convert payload to string
   String jsonString;
   for (unsigned int i = 0; i < length; i++)
   {
     jsonString += (char)payload[i];
   }
 
-  Serial.println(jsonString);
-
-  // Parse JSON
   StaticJsonDocument<256> doc;
   DeserializationError error = deserializeJson(doc, jsonString);
 
-  if (error)
-  {
-    Serial.print("JSON parse failed: ");
-    Serial.println(error.c_str());
-    return;
-  }
-
-  // Lock mutex
-  if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY) == pdTRUE)
+  if (!error && xSemaphoreTake(sensorDataMutex, portMAX_DELAY) == pdTRUE)
   {
     temperature = doc["temperature"] | temperature;
     humidity = doc["humidity"] | humidity;
     pressure = doc["pressure"] | pressure;
     gas_resistance = doc["gas_resistance"] | gas_resistance;
     altitude = doc["altitude"] | altitude;
+    tvoc = doc["tvoc"] | tvoc;
+    eco2 = doc["eco2"] | eco2;
 
     xSemaphoreGive(sensorDataMutex);
-
     needsRedraw = true;
   }
 }
@@ -167,11 +160,7 @@ bool reconnectMQTT()
   {
     mqttConnected = true;
     Serial.println("MQTT Connected");
-
-    // Subscribe to all sensor topics
     mqttClient.subscribe(topic_sensor_json);
-
-    Serial.println("Subscribed to sensor topics");
     needsRedraw = true;
     return true;
   }
@@ -181,325 +170,289 @@ bool reconnectMQTT()
 }
 
 // -----------------------------------------------------------------------------
-// Draw mini icon helpers
+// Enhanced Drawing Functions
 // -----------------------------------------------------------------------------
-void drawTempIcon(int x, int y)
+
+// Draw rounded rectangle
+void drawRoundRect(int x, int y, int w, int h, int r, uint16_t color)
 {
-  // Thermometer icon
-  tft.fillCircle(x + 4, y + 12, 3, ST77XX_RED);
-  tft.fillRect(x + 3, y, 3, 10, ST77XX_RED);
-  tft.drawRect(x + 2, y, 5, 10, ST77XX_WHITE);
+  tft.fillRect(x + r, y, w - 2 * r, h, color);
+  tft.fillRect(x, y + r, w, h - 2 * r, color);
+  tft.fillCircle(x + r, y + r, r, color);
+  tft.fillCircle(x + w - r - 1, y + r, r, color);
+  tft.fillCircle(x + r, y + h - r - 1, r, color);
+  tft.fillCircle(x + w - r - 1, y + h - r - 1, r, color);
 }
 
-void drawHumidityIcon(int x, int y)
+// Draw modern status indicator
+void drawStatusIndicator(int x, int y, bool connected, const char *label)
 {
-  // Water droplet
-  tft.fillTriangle(x + 4, y, x, y + 8, x + 8, y + 8, ST77XX_CYAN);
-  tft.fillCircle(x + 4, y + 7, 3, ST77XX_CYAN);
+  uint16_t color = connected ? COLOR_ACCENT : 0x7BEF;
+  tft.fillCircle(x, y, 4, color);
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT_SECONDARY);
+  tft.setCursor(x - 10, y + 8);
+  tft.print(label);
 }
 
-void drawPressureIcon(int x, int y)
+// Draw sensor icon with modern style
+void drawModernTempIcon(int x, int y)
 {
-  // Gauge/dial icon
-  tft.drawCircle(x + 5, y + 6, 5, ST77XX_YELLOW);
-  tft.drawLine(x + 5, y + 6, x + 8, y + 3, ST77XX_YELLOW);
+  tft.fillRoundRect(x, y, 12, 20, 2, COLOR_TEMP);
+  tft.fillCircle(x + 6, y + 16, 4, COLOR_TEMP);
+  tft.fillRect(x + 4, y + 6, 4, 8, COLOR_BG);
 }
 
-void drawGasIcon(int x, int y)
+void drawModernHumidIcon(int x, int y)
 {
-  // Cloud/gas icon
-  tft.fillCircle(x + 3, y + 5, 3, ST77XX_MAGENTA);
-  tft.fillCircle(x + 7, y + 5, 3, ST77XX_MAGENTA);
-  tft.fillRect(x + 3, y + 5, 5, 3, ST77XX_MAGENTA);
-}
-
-void drawAltitudeIcon(int x, int y)
-{
-  // Mountain icon
-  tft.fillTriangle(x, y + 8, x + 4, y, x + 8, y + 8, ST77XX_GREEN);
-  tft.fillTriangle(x + 4, y + 8, x + 8, y + 3, x + 12, y + 8, ST77XX_GREEN);
-}
-
-// Draw bar graph for a value
-void drawBarGraph(int x, int y, int w, int h, float value, float minVal, float maxVal, uint16_t color)
-{
-  // Background
-  tft.drawRect(x, y, w, h, ST77XX_WHITE);
-  // Filled portion
-  int fillWidth = map(constrain(value, minVal, maxVal), minVal, maxVal, 0, w - 2);
-  if (fillWidth > 0)
+  for (int i = 0; i < 3; i++)
   {
-    tft.fillRect(x + 1, y + 1, fillWidth, h - 2, color);
+    tft.fillCircle(x + 6, y + 12 - i, 6 - i * 2, COLOR_HUMID);
+  }
+  tft.fillTriangle(x + 6, y, x, y + 8, x + 12, y + 8, COLOR_HUMID);
+}
+
+void drawModernPressIcon(int x, int y)
+{
+  tft.drawCircle(x + 6, y + 8, 7, COLOR_PRESS);
+  tft.drawCircle(x + 6, y + 8, 5, COLOR_PRESS);
+  tft.fillCircle(x + 6, y + 8, 2, COLOR_PRESS);
+  tft.drawLine(x + 6, y + 8, x + 11, y + 4, COLOR_PRESS);
+}
+
+void drawModernGasIcon(int x, int y)
+{
+  for (int i = 0; i < 4; i++)
+  {
+    tft.fillCircle(x + 3 + i * 2, y + 8 - abs(i - 1.5) * 2, 2, COLOR_GAS);
+  }
+  tft.fillRect(x + 2, y + 8, 9, 4, COLOR_GAS);
+}
+
+void drawModernAltIcon(int x, int y)
+{
+  tft.fillTriangle(x, y + 12, x + 6, y, x + 12, y + 12, COLOR_ALT);
+  tft.fillRect(x, y + 12, 12, 3, COLOR_ALT);
+}
+
+// Draw enhanced bar with gradient effect
+void drawEnhancedBar(int x, int y, int w, int h, float value, float minVal, float maxVal, uint16_t color)
+{
+  // Background with border
+  tft.fillRoundRect(x, y, w, h, 3, 0x2104);
+  tft.drawRoundRect(x, y, w, h, 3, 0x4208);
+
+  // Calculate fill
+  int fillWidth = map(constrain(value, minVal, maxVal), minVal, maxVal, 0, w - 4);
+  if (fillWidth > 4)
+  {
+    tft.fillRoundRect(x + 2, y + 2, fillWidth, h - 4, 2, color);
   }
 }
 
-// -----------------------------------------------------------------------------
-// Sensor data display with scrolling
-// -----------------------------------------------------------------------------
-void drawSensorData()
+// Draw sensor card with modern design
+void drawSensorCard(int y, const char *label, float value, const char *unit,
+                    void (*iconFunc)(int, int), uint16_t color,
+                    float minVal, float maxVal)
 {
-  tft.fillScreen(ST77XX_BLACK);
+  int cardX = 8;
+  int cardW = TFT_WIDTH - 16;
 
-  // Draw title bar with gradient effect
-  tft.fillRect(0, 0, TFT_WIDTH, topMargin - 5, ST77XX_BLUE);
-  tft.drawLine(0, topMargin - 5, TFT_WIDTH, topMargin - 5, ST77XX_CYAN);
+  // Card background with shadow effect
+  drawRoundRect(cardX + 2, y + 2, cardW, cardHeight, 6, 0x0000);
+  drawRoundRect(cardX, y, cardW, cardHeight, 6, COLOR_CARD);
+
+  // Draw icon
+  iconFunc(cardX + 8, y + 10);
+
+  // Label
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT_SECONDARY);
+  tft.setCursor(cardX + 28, y + 6);
+  tft.print(label);
+
+  // Value
+  tft.setTextSize(2);
+  tft.setTextColor(color);
+  tft.setCursor(cardX + 28, y + 16);
+
+  char valStr[16];
+  if (strcmp(unit, "k") == 0)
+  {
+    sprintf(valStr, "%.0f", value / 1000);
+  }
+  else if (strcmp(unit, "hPa") == 0)
+  {
+    sprintf(valStr, "%.0f", value);
+  }
+  else
+  {
+    sprintf(valStr, "%.1f", value);
+  }
+  tft.print(valStr);
+  tft.print(" ");
+  tft.setTextColor(COLOR_TEXT_SECONDARY);
+  tft.print(unit);
+
+  // Progress bar
+  int barX = cardX + 135;
+  int barW = 70;
+  drawEnhancedBar(barX, y + 12, barW, 12, value, minVal, maxVal, color);
+}
+
+// -----------------------------------------------------------------------------
+// Main Display Drawing
+// -----------------------------------------------------------------------------
+void drawEnhancedSensorData()
+{
+  tft.fillScreen(COLOR_BG);
+
+  // Modern header with gradient
+  for (int i = 0; i < topMargin - 5; i++)
+  {
+    uint16_t gradColor = tft.color565(0, 60 + i, 100 + i);
+    tft.drawFastHLine(0, i, TFT_WIDTH, gradColor);
+  }
+
+  // Header title
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(10, 8);
-  tft.print("Sensor Data");
+  tft.setCursor(12, 12);
+  tft.print("Sensor Monitor");
 
-  // Show connection status
-  tft.setTextSize(1);
-  if (wifiConnected)
-  {
-    tft.fillCircle(TFT_WIDTH - 30, 10, 3, ST77XX_GREEN);
-  }
-  else
-  {
-    tft.fillCircle(TFT_WIDTH - 30, 10, 3, ST77XX_RED);
-  }
-  if (mqttConnected)
-  {
-    tft.fillCircle(TFT_WIDTH - 15, 10, 3, ST77XX_GREEN);
-  }
-  else
-  {
-    tft.fillCircle(TFT_WIDTH - 15, 10, 3, ST77XX_RED);
-  }
-  tft.setTextSize(2);
+  // Status indicators
+  drawStatusIndicator(TFT_WIDTH - 50, 18, wifiConnected, "WiFi");
+  drawStatusIndicator(TFT_WIDTH - 20, 18, mqttConnected, "MQTT");
 
-  // Calculate total content height
-  int numLines = 5;                                // Number of data lines
-  totalContentHeight = numLines * lineHeight + 20; // +20 for padding
+  // Separator line
+  tft.drawFastHLine(0, topMargin - 5, TFT_WIDTH, COLOR_ACCENT);
+
+  // Calculate scrolling
+  int numCards = 5;
+  totalContentHeight = numCards * (cardHeight + cardSpacing) + 10;
   int visibleHeight = TFT_HEIGHT - topMargin;
-
-  // Calculate max scroll
   maxScroll = max(0, totalContentHeight - visibleHeight);
-
-  // Constrain scroll offset
   scrollOffset = constrain(scrollOffset, 0, maxScroll);
 
-  // Set text parameters
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_WHITE);
+  // Smooth scrolling animation
+  smoothScroll += (scrollOffset - smoothScroll) * scrollSmoothing;
 
-  // Lock mutex before reading sensor data
+  // Lock and draw sensor cards
   if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY) == pdTRUE)
   {
-    // Starting Y position (adjusted for scroll)
-    int y = topMargin + 10 - scrollOffset;
-    int iconX = 5;
-    int textX = 25;
-    int barX = 150;
-    int barW = 65;
+    int y = topMargin + 5 - (int)smoothScroll;
 
-    // Temperature
-    if (y > topMargin - lineHeight && y < TFT_HEIGHT)
+    if (y > topMargin - cardHeight && y < TFT_HEIGHT)
     {
-      drawTempIcon(iconX, y);
-      tft.setCursor(textX, y);
-      tft.print(temperature, 1);
-      tft.print("C");
-      drawBarGraph(barX, y + 2, barW, 12, temperature, 0, 50, ST77XX_RED);
+      drawSensorCard(y, "Temperature", temperature, "C",
+                     drawModernTempIcon, COLOR_TEMP, 0, 50);
     }
-    y += lineHeight;
+    y += cardHeight + cardSpacing;
 
-    // Humidity
-    if (y > topMargin - lineHeight && y < TFT_HEIGHT)
+    if (y > topMargin - cardHeight && y < TFT_HEIGHT)
     {
-      drawHumidityIcon(iconX, y);
-      tft.setCursor(textX, y);
-      tft.print(humidity, 1);
-      tft.print("%");
-      drawBarGraph(barX, y + 2, barW, 12, humidity, 0, 100, ST77XX_CYAN);
+      drawSensorCard(y, "Humidity", humidity, "%",
+                     drawModernHumidIcon, COLOR_HUMID, 0, 100);
     }
-    y += lineHeight;
+    y += cardHeight + cardSpacing;
 
-    // Pressure
-    if (y > topMargin - lineHeight && y < TFT_HEIGHT)
+    if (y > topMargin - cardHeight && y < TFT_HEIGHT)
     {
-      drawPressureIcon(iconX, y);
-      tft.setCursor(textX, y);
-      tft.print(pressure, 0);
-      tft.print("hPa");
-      drawBarGraph(barX, y + 2, barW, 12, pressure, 950, 1050, ST77XX_YELLOW);
+      drawSensorCard(y, "Pressure", pressure, "hPa",
+                     drawModernPressIcon, COLOR_PRESS, 950, 1050);
     }
-    y += lineHeight;
+    y += cardHeight + cardSpacing;
 
-    // Gas
-    if (y > topMargin - lineHeight && y < TFT_HEIGHT)
+    if (y > topMargin - cardHeight && y < TFT_HEIGHT)
     {
-      drawGasIcon(iconX, y);
-      tft.setCursor(textX, y);
-      tft.print(gas_resistance / 1000);
-      tft.print("k");
-      drawBarGraph(barX, y + 2, barW, 12, gas_resistance, 0, 300000, ST77XX_MAGENTA);
+      drawSensorCard(y, "Gas", gas_resistance, "k",
+                     drawModernGasIcon, COLOR_GAS, 0, 300000);
     }
-    y += lineHeight;
+    y += cardHeight + cardSpacing;
 
-    // Altitude
-    if (y > topMargin - lineHeight && y < TFT_HEIGHT)
+    if (y > topMargin - cardHeight && y < TFT_HEIGHT)
     {
-      drawAltitudeIcon(iconX, y);
-      tft.setCursor(textX, y);
-      tft.print(altitude, 1);
-      tft.print("m");
-      drawBarGraph(barX, y + 2, barW, 12, altitude, 0, 500, ST77XX_GREEN);
+      drawSensorCard(y, "Altitude", altitude, "m",
+                     drawModernAltIcon, COLOR_ALT, 0, 500);
     }
 
-    // Release mutex
     xSemaphoreGive(sensorDataMutex);
   }
 
-  // Draw scroll indicator if content overflows
+  // Modern scroll indicator
   if (maxScroll > 0)
   {
-    int scrollBarHeight = (visibleHeight * visibleHeight) / totalContentHeight;
-    int scrollBarPos = topMargin + (scrollOffset * (visibleHeight - scrollBarHeight)) / maxScroll;
+    int scrollBarH = max(10, (visibleHeight * visibleHeight) / totalContentHeight);
+    int scrollBarY = topMargin + (scrollOffset * (visibleHeight - scrollBarH)) / maxScroll;
 
-    tft.fillRect(TFT_WIDTH - 5, scrollBarPos, 3, scrollBarHeight, ST77XX_GREEN);
+    tft.fillRoundRect(TFT_WIDTH - 6, scrollBarY, 4, scrollBarH, 2, COLOR_ACCENT);
   }
 }
 
 // -----------------------------------------------------------------------------
-// Drawing helpers (kept for other functionality)
-// -----------------------------------------------------------------------------
-void clearWithLabel(const char *text)
-{
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(10, 10);
-  tft.print(text);
-}
-
-void drawArrowUp()
-{
-  clearWithLabel("UP");
-  int cx = tft.width() / 2;
-  int cy = tft.height() / 2;
-  tft.fillTriangle(cx, cy - 50, cx - 30, cy + 20, cx + 30, cy + 20, ST77XX_GREEN);
-}
-
-void drawArrowDown()
-{
-  clearWithLabel("DOWN");
-  int cx = tft.width() / 2;
-  int cy = tft.height() / 2;
-  tft.fillTriangle(cx, cy + 50, cx - 30, cy - 20, cx + 30, cy - 20, ST77XX_GREEN);
-}
-
-void drawArrowLeft()
-{
-  clearWithLabel("LEFT");
-  int cx = tft.width() / 2;
-  int cy = tft.height() / 2;
-  tft.fillTriangle(cx - 50, cy, cx + 20, cy - 30, cx + 20, cy + 30, ST77XX_GREEN);
-}
-
-void drawArrowRight()
-{
-  clearWithLabel("RIGHT");
-  int cx = tft.width() / 2;
-  int cy = tft.height() / 2;
-  tft.fillTriangle(cx + 50, cy, cx - 20, cy - 30, cx - 20, cy + 30, ST77XX_GREEN);
-}
-
-void drawCenterOK()
-{
-  clearWithLabel("CENTER");
-  int cx = tft.width() / 2;
-  int cy = tft.height() / 2;
-  tft.fillCircle(cx, cy, 35, ST77XX_BLUE);
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(cx - 20, cy - 8);
-  tft.print("OK");
-}
-
-// -----------------------------------------------------------------------------
-// RTOS Task: Display & Button Handling
+// RTOS Task: Display & Input
 // -----------------------------------------------------------------------------
 void TaskDisplayCode(void *parameter)
 {
-  Serial.println("Display Task started on core " + String(xPortGetCoreID()));
+  Serial.println("Display Task on core " + String(xPortGetCoreID()));
 
   bool lastUpState = false;
   bool lastDownState = false;
 
   for (;;)
   {
-    // Read button states
     bool up = (digitalRead(SW_UP) == LOW);
     bool down = (digitalRead(SW_DOWN) == LOW);
-    bool left = (digitalRead(SW_LEFT) == LOW);
-    bool right = (digitalRead(SW_RIGHT) == LOW);
     bool center = (digitalRead(SW_CENTER) == LOW);
 
-    // Detect rising edge for scrolling
     bool upPressed = up && !lastUpState;
     bool downPressed = down && !lastDownState;
 
     lastUpState = up;
     lastDownState = down;
 
-    // Handle scrolling
     if (upPressed && scrollOffset > 0)
     {
-      scrollOffset -= lineHeight;
-      if (scrollOffset < 0)
-        scrollOffset = 0;
+      targetScrollOffset = scrollOffset - (cardHeight + cardSpacing);
+      scrollOffset = max(0, targetScrollOffset);
       needsRedraw = true;
       Serial.println("Scroll UP");
     }
     else if (downPressed && scrollOffset < maxScroll)
     {
-      scrollOffset += lineHeight;
-      if (scrollOffset > maxScroll)
-        scrollOffset = maxScroll;
+      targetScrollOffset = scrollOffset + (cardHeight + cardSpacing);
+      scrollOffset = min(maxScroll, targetScrollOffset);
       needsRedraw = true;
       Serial.println("Scroll DOWN");
     }
-    else if (left)
-    {
-      drawArrowLeft();
-      Serial.println("LEFT");
-      vTaskDelay(300 / portTICK_PERIOD_MS); // Debounce
-    }
-    else if (right)
-    {
-      drawArrowRight();
-      Serial.println("RIGHT");
-      vTaskDelay(300 / portTICK_PERIOD_MS); // Debounce
-    }
     else if (center)
     {
-      // Reset scroll and redraw
       scrollOffset = 0;
+      smoothScroll = 0;
       needsRedraw = true;
-      Serial.println("CENTER - Reset View");
-      vTaskDelay(300 / portTICK_PERIOD_MS); // Debounce
+      Serial.println("Reset");
+      vTaskDelay(300 / portTICK_PERIOD_MS);
     }
 
-    // Redraw if needed
-    if (needsRedraw)
+    // Always update for smooth animation
+    if (abs(smoothScroll - scrollOffset) > 0.5 || needsRedraw)
     {
-      drawSensorData();
+      drawEnhancedSensorData();
       needsRedraw = false;
     }
 
-    vTaskDelay(50 / portTICK_PERIOD_MS); // 50ms update rate
+    vTaskDelay(20 / portTICK_PERIOD_MS); // 50 FPS
   }
 }
 
 // -----------------------------------------------------------------------------
-// RTOS Task: MQTT Handling
+// RTOS Task: MQTT
 // -----------------------------------------------------------------------------
 void TaskMQTTCode(void *parameter)
 {
-  Serial.println("MQTT Task started on core " + String(xPortGetCoreID()));
+  Serial.println("MQTT Task on core " + String(xPortGetCoreID()));
 
-  unsigned long lastReconnectAttempt = 0;
+  unsigned long lastReconnect = 0;
 
   for (;;)
   {
@@ -508,101 +461,71 @@ void TaskMQTTCode(void *parameter)
       if (!mqttClient.connected())
       {
         unsigned long now = millis();
-        if (now - lastReconnectAttempt > 5000)
-        { // Try reconnecting every 5 seconds
-          lastReconnectAttempt = now;
-          Serial.println("Attempting MQTT reconnection...");
+        if (now - lastReconnect > 5000)
+        {
+          lastReconnect = now;
+          Serial.println("Reconnecting MQTT...");
           if (reconnectMQTT())
           {
-            lastReconnectAttempt = 0;
+            lastReconnect = 0;
           }
         }
       }
       else
       {
-        mqttClient.loop(); // Process incoming MQTT messages
+        mqttClient.loop();
       }
     }
-
-    vTaskDelay(10 / portTICK_PERIOD_MS); // 10ms update rate for MQTT
+    vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
 
 // -----------------------------------------------------------------------------
-// Setup & Main Loop
+// Setup
 // -----------------------------------------------------------------------------
 void setup()
 {
   Serial.begin(115200);
+  Serial.println("Enhanced Sensor Display Starting...");
 
-  Serial.println("Starting ESP32 Sensor Display with RTOS...");
-
-  // Switch pins as inputs with internal pull-ups
   pinMode(SW_UP, INPUT_PULLUP);
   pinMode(SW_DOWN, INPUT_PULLUP);
   pinMode(SW_LEFT, INPUT_PULLUP);
   pinMode(SW_RIGHT, INPUT_PULLUP);
   pinMode(SW_CENTER, INPUT_PULLUP);
 
-  // TFT
   tft.init(TFT_WIDTH, TFT_HEIGHT);
   tft.setRotation(90);
-  tft.fillScreen(ST77XX_BLACK);
+  tft.fillScreen(COLOR_BG);
 
-  // Backlight
   backlightSetup();
 
-  // Show connecting message
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(10, 100);
+  tft.setCursor(40, 100);
   tft.print("Connecting...");
 
-  // Create mutex for sensor data protection
   sensorDataMutex = xSemaphoreCreateMutex();
 
-  // Setup WiFi
   setupWiFi();
 
-  // Setup MQTT
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
 
-  // Try to connect to MQTT
   if (wifiConnected)
   {
     reconnectMQTT();
   }
 
-  // Display sensor data initially
-  drawSensorData();
+  drawEnhancedSensorData();
 
-  // Create RTOS Tasks
-  // Task 1: Display & Button handling on Core 1
-  xTaskCreatePinnedToCore(
-      TaskDisplayCode, /* Task function */
-      "TaskDisplay",   /* Name of task */
-      10000,           /* Stack size (bytes) */
-      NULL,            /* Parameter passed to task */
-      1,               /* Task priority */
-      &TaskDisplay,    /* Task handle */
-      1);              /* Core where task runs (Core 1) */
+  xTaskCreatePinnedToCore(TaskDisplayCode, "Display", 10000, NULL, 1, &TaskDisplay, 1);
+  xTaskCreatePinnedToCore(TaskMQTTCode, "MQTT", 10000, NULL, 1, &TaskMQTT, 0);
 
-  // Task 2: MQTT handling on Core 0
-  xTaskCreatePinnedToCore(
-      TaskMQTTCode, /* Task function */
-      "TaskMQTT",   /* Name of task */
-      10000,        /* Stack size (bytes) */
-      NULL,         /* Parameter passed to task */
-      1,            /* Task priority */
-      &TaskMQTT,    /* Task handle */
-      0);           /* Core where task runs (Core 0) */
-
-  Serial.println("RTOS Tasks created successfully!");
+  Serial.println("Setup complete!");
 }
 
 void loop()
 {
-  // Empty - all work is done in RTOS tasks
   vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
